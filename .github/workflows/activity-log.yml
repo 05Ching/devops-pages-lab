@@ -1,0 +1,91 @@
+name: Update Activity Log into README
+
+on:
+  schedule:
+    # 每天 22:00 UTC = 台北早上 6:00
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/activity-log.yml"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_USERNAME: ${{ github.repository_owner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch public events from GitHub API
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -s -H "Authorization: token ${TOKEN}" \
+            "https://api.github.com/users/${GH_USERNAME}/events/public?per_page=60" > events.json
+
+          jq -r '
+            [ .[] |
+              {
+                type: .type,
+                repo: .repo.name,
+                created_at: .created_at,
+                action: ( .payload.action // "" ),
+                pr: ( .payload.pull_request.number // .payload.issue.number // "" )
+              }
+            ][0:20] |
+            ( "# Recent Public Activity" ),
+            ( "Updated: " + (now | strftime("%Y-%m-%d %H:%M:%S UTC")) ),
+            "",
+            ( to_entries[] |
+              "- " +
+              (.value.created_at | sub("T"; " "; "g") | sub("Z$"; ""; "g")) +
+              " • " + .value.type +
+              (if .value.action != "" then " (" + .value.action + ")" else "" end) +
+              " • " + .value.repo +
+              (if .value.pr|tostring != "" then " #" + (.value.pr|tostring) else "" end)
+            )
+          ' events.json > ACTIVITY.md
+
+      - name: Inject into README between markers
+        run: |
+          set -euo pipefail
+          START="<!--ACTIVITY-LOG:START-->"
+          END="<!--ACTIVITY-LOG:END-->"
+          if ! grep -q "$START" README.md || ! grep -q "$END" README.md; then
+            echo "README.md 缺少占位符 ${START}/${END}" >&2
+            exit 1
+          fi
+          awk -v start="$START" -v end="$END" '
+            BEGIN{printing=0}
+            {
+              if ($0 ~ start) {
+                print; printing=1;
+                while ((getline line < "ACTIVITY.md") > 0) print line;
+                next
+              }
+              if ($0 ~ end) { printing=0 }
+              if (printing==0) print
+            }
+          ' README.md > README.new
+          mv README.new README.md
+
+      - name: Commit changes
+        run: |
+          set -euo pipefail
+          if git diff --quiet README.md; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git config user.name "activity-log-bot"
+          git config user.email "activity-log-bot@users.noreply.github.com"
+          git add README.md
+          git commit -m "chore(activity-log): update README with latest public events"
+          git push
